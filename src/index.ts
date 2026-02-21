@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
+import { createRequire } from "node:module";
 import { initCommand } from "./commands/init.js";
 import { runCommand } from "./commands/run.js";
+
+const require = createRequire(import.meta.url);
+const packageJson = require("../package.json") as { version?: string };
+const APP_VERSION = packageJson.version ?? "0.0.0";
 
 const program = new Command();
 
@@ -10,9 +15,9 @@ program
   .name("bandmaster")
   .description("Bandmaster CLI")
   .action(async () => {
-    await initCommand({});
+    await initCommand({ version: APP_VERSION });
   })
-  .version("0.1.0");
+  .version(APP_VERSION);
 
 program
   .command("init")
@@ -20,7 +25,8 @@ program
   .option("-c, --config <path>", "Path to project config file")
   .action(async (options: { config?: string }) => {
     await initCommand({
-      config: options.config
+      config: options.config,
+      version: APP_VERSION
     });
   });
 

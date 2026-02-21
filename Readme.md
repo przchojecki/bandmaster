@@ -365,9 +365,11 @@ Menu sections:
 - `2. Configure manager LLM`
 - `3. Settings`
 - `4. Run AI work` (collect project/docs, save config, and immediately run)
+- `5. Quick Run` (inline worker prompt + choose rounds/hours, then immediately run)
 
 Subscription authentication flow:
 - Selecting `Subscription` immediately launches auth (no extra submenu).
 - Codex: runs `codex login`
 - Claude: runs `claude setup-token`
 - Gemini: runs `gemini auth login`
+- Auth is reused per provider within the same menu session (no double login for Worker/Manager on same provider).

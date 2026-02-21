@@ -4,7 +4,7 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { loadProjectConfig, ProjectConfigSchema } from "../config/index.js";
-import { runCommand } from "./run.js";
+import { runCommand, runQuickCommand } from "./run.js";
 import type { ProjectConfig, ProviderName } from "../config/index.js";
 
 type PolicyMode = "auto" | "safe-only" | "manual";
@@ -15,6 +15,7 @@ type AuthMode = "api" | "subscription";
 interface InitCommandOptions {
   config?: string;
   cwd?: string;
+  version?: string;
 }
 
 interface ModelRef {
@@ -33,9 +34,9 @@ const BANDMASTER_BANNER = [
 
 const PROVIDERS: ProviderName[] = ["codex", "claude", "gemini", "ollama"];
 const DEFAULT_MODEL_BY_PROVIDER: Record<ProviderName, string> = {
-  codex: "gpt-5-codex",
-  claude: "claude-sonnet-4-5",
-  gemini: "gemini-2.0-flash",
+  codex: "gpt-5.3-codex",
+  claude: "claude-opus-4-1",
+  gemini: "gemini-3-pro-preview",
   ollama: "llama3.1:8b"
 };
 
@@ -52,6 +53,25 @@ const SUBSCRIPTION_AUTH_COMMAND: Record<Exclude<ProviderName, "ollama">, string>
   gemini: "gemini auth login"
 };
 
+const LEGACY_MODEL_REWRITES: Partial<Record<ProviderName, Record<string, string>>> = {
+  codex: {
+    "gpt-5-codex": "gpt-5.3-codex",
+    "gpt-5.2-codex": "gpt-5.3-codex"
+  },
+  claude: {
+    "claude-sonnet-4-5": "claude-opus-4-1",
+    "opus-4.6": "claude-opus-4-1"
+  },
+  gemini: {
+    "gemini-2.0-flash": "gemini-3-pro-preview",
+    "gemini-3.1-pro": "gemini-3-pro-preview"
+  }
+};
+
+const LEGACY_SUBSCRIPTION_COMMAND_REWRITES: Record<string, string> = {
+  "codex --login": "codex login"
+};
+
 function tomlString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
@@ -61,6 +81,43 @@ function normalizeEntryDocs(value: string): string[] {
     .split(",")
     .map((doc) => doc.trim())
     .filter((doc) => doc.length > 0);
+}
+
+function normalizeModel(provider: ProviderName, model: string): string {
+  const rewrites = LEGACY_MODEL_REWRITES[provider];
+  if (!rewrites) {
+    return model;
+  }
+  return rewrites[model] ?? model;
+}
+
+function normalizeDraftConfig(draft: ProjectConfig): ProjectConfig {
+  draft.worker.primary.model = normalizeModel(
+    draft.worker.primary.provider,
+    draft.worker.primary.model
+  );
+  draft.worker.fallback = draft.worker.fallback.map((ref) => ({
+    ...ref,
+    model: normalizeModel(ref.provider, ref.model)
+  }));
+
+  draft.pm.primary.model = normalizeModel(draft.pm.primary.provider, draft.pm.primary.model);
+  draft.pm.fallback = draft.pm.fallback.map((ref) => ({
+    ...ref,
+    model: normalizeModel(ref.provider, ref.model)
+  }));
+
+  for (const provider of Object.keys(draft.providers)) {
+    const auth = draft.providers[provider]?.auth;
+    if (!auth || auth.mode !== "subscription" || !auth.subscriptionCommand) {
+      continue;
+    }
+    auth.subscriptionCommand =
+      LEGACY_SUBSCRIPTION_COMMAND_REWRITES[auth.subscriptionCommand] ??
+      auth.subscriptionCommand;
+  }
+
+  return draft;
 }
 
 function toProjectToml(config: ProjectConfig): string {
@@ -162,29 +219,29 @@ function createDefaultConfig(cwd: string): ProjectConfig {
       name: path.basename(cwd) || "bandmaster-project",
       objective: "Build the software described in README.md and supporting docs.",
       workspace: ".",
-      entryDocs: ["README.md", "TASKS.md", "DESIGN.md"]
+      entryDocs: ["README.md"]
     },
     worker: {
       primary: {
         provider: "codex",
-        model: "gpt-5-codex"
+        model: DEFAULT_MODEL_BY_PROVIDER.codex
       },
       fallback: [
         {
           provider: "claude",
-          model: "claude-sonnet-4-5"
+          model: DEFAULT_MODEL_BY_PROVIDER.claude
         }
       ]
     },
     pm: {
       primary: {
         provider: "claude",
-        model: "claude-sonnet-4-5"
+        model: DEFAULT_MODEL_BY_PROVIDER.claude
       },
       fallback: [
         {
           provider: "gemini",
-          model: "gemini-2.0-flash"
+          model: DEFAULT_MODEL_BY_PROVIDER.gemini
         }
       ],
       userProxy: {
@@ -220,7 +277,7 @@ function createDefaultConfig(cwd: string): ProjectConfig {
       codex: {
         auth: {
           mode: "subscription",
-          subscriptionCommand: "codex --login"
+          subscriptionCommand: "codex login"
         }
       },
       claude: {
@@ -310,6 +367,7 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
   const configPath = path.resolve(cwd, options.config ?? ".bandmaster/project.toml");
   const rl = createInterface({ input, output });
+  const configuredProvidersInSession = new Set<ProviderName>();
 
   const askText = async (
     question: string,
@@ -423,9 +481,24 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
     draft: ProjectConfig,
     provider: ProviderName
   ): Promise<void> => {
+    if (configuredProvidersInSession.has(provider)) {
+      const existingAuth = draft.providers[provider]?.auth;
+      if (provider === "ollama") {
+        console.log("ollama connection already set for this session. Reusing it.");
+      } else if (existingAuth) {
+        console.log(
+          `${provider} connection already configured in this session (${existingAuth.mode}). Reusing it.`
+        );
+      } else {
+        console.log(`${provider} connection already configured in this session. Reusing it.`);
+      }
+      return;
+    }
+
     if (provider === "ollama") {
       delete draft.providers[provider];
       console.log(`${provider} uses local runtime. No API/subscription setup required.`);
+      configuredProvidersInSession.add(provider);
       return;
     }
 
@@ -452,6 +525,7 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
           apiKeyEnv
         }
       };
+      configuredProvidersInSession.add(provider);
       return;
     }
 
@@ -481,6 +555,7 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
         subscriptionCommand: selectedCommand
       }
     };
+    configuredProvidersInSession.add(provider);
   };
 
   const configureWorker = async (draft: ProjectConfig): Promise<void> => {
@@ -703,10 +778,42 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
     await mkdir(path.dirname(configPath), { recursive: true });
     await writeFile(configPath, toProjectToml(parsed), "utf8");
 
-    console.log("\nWrote project config:");
-    console.log(configPath);
-    console.log("\nStarting run with saved config...\n");
+    console.log("\n[System] Wrote project config:");
+    console.log(`[System] ${configPath}`);
+    console.log("\n[System] Starting run with saved config...\n");
     await runCommand({ config: configPath, cwd });
+    return true;
+  };
+
+  const runQuick = async (draft: ProjectConfig): Promise<boolean> => {
+    console.log("\nQuick Run");
+    const prompt = await askText(
+      "Prompt to Worker LLM",
+      draft.project.objective,
+      (value) => (value.length > 0 ? undefined : "Prompt is required.")
+    );
+    const durationMode = await askChoice(
+      "Quick run budget mode:",
+      ["rounds", "hours"] as const,
+      "hours"
+    );
+
+    const defaultDuration =
+      durationMode === "hours"
+        ? Math.max(1, Math.floor(draft.budget.maxMinutes / 60))
+        : draft.budget.maxTurns;
+    const durationValue = await askPositiveInt(
+      durationMode === "hours" ? "Run for how many hours" : "Run for how many rounds",
+      defaultDuration
+    );
+
+    console.log("\n[System] Starting quick run with inline prompt...\n");
+    await runQuickCommand({
+      config: draft,
+      prompt,
+      mode: durationMode,
+      value: durationValue
+    });
     return true;
   };
 
@@ -715,7 +822,7 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
     if (await pathExists(configPath)) {
       try {
         const loaded = await loadProjectConfig({ configPath, cwd });
-        draft = loaded.config;
+        draft = normalizeDraftConfig(loaded.config);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         console.warn(`Could not load existing config at ${configPath}. Using defaults.`);
@@ -723,8 +830,10 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
       }
     }
 
+    draft = normalizeDraftConfig(draft);
+
     console.log(BANDMASTER_BANNER);
-    console.log("\nBandmaster Interactive Menu");
+    console.log(`\nv${options.version ?? "0.0.0"}`);
 
     let finished = false;
     while (!finished) {
@@ -739,9 +848,10 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
         `3. Settings (policy=${draft.policy.mode}, checkpoint=${draft.checkpoint.intervalMinutes}m, session=${draft.budget.maxMinutes}m, cycle=${draft.budget.cycle.maxTokens}t)`
       );
       console.log("4. Run AI work (project/docs + save + run)");
-      console.log("5. Exit without saving");
+      console.log("5. Quick Run (inline prompt + rounds/hours)");
+      console.log("6. Exit without saving");
 
-      const choice = await askMenuChoice(1, 5);
+      const choice = await askMenuChoice(1, 6);
 
       if (choice === 1) {
         await configureWorker(draft);
@@ -757,6 +867,10 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
       }
       if (choice === 4) {
         finished = await runAiWorkAndSave(draft);
+        continue;
+      }
+      if (choice === 5) {
+        finished = await runQuick(draft);
         continue;
       }
 
