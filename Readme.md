@@ -9,6 +9,8 @@ It currently provides:
 - TOML config generation and validation (`.bandmaster/project.toml`)
 - a quick execution loop that invokes provider CLIs
 - a non-interactive config validation command (`bandmaster run`)
+- a metric-driven optimization loop (`bandmaster loop`)
+- session history viewing (`bandmaster history`)
 
 ## Current Status
 
@@ -19,10 +21,10 @@ Implemented now:
 - provider auth mode setup (API key env var or subscription command)
 - `run` command that validates config and reports effective settings
 - "Quick Run" loop (round-based or hour-based) that launches worker/manager CLIs
+- `loop` command that keeps/discards candidate commits by evaluation metric
 
 Not implemented yet:
 - full orchestration engine/state machine
-- persistent session history/checkpoint storage
 - provider adapters with normalized event protocol
 
 ## Requirements
@@ -92,6 +94,39 @@ Loads and validates project config, then prints a run summary:
 - missing entry docs (warning)
 
 Note: this command currently validates and reports settings. It does not start a long-running orchestrated agent session.
+
+### `bandmaster loop [options]`
+
+Runs a closed loop for complex tasks:
+1. worker model edits the codebase
+2. Bandmaster creates a candidate commit
+3. evaluation command runs (benchmark/test/research harness)
+4. metric is extracted from output via regex
+5. candidate is kept or discarded based on metric improvement
+
+Core options:
+- `--run-command "<cmd>"` evaluation command per round
+- `--metric-pattern "<regex>"` regex for metric extraction
+- `--optimize max|min` metric direction
+- `--keep-threshold <number>` minimum improvement required
+- `--max-rounds <number>`
+- `--timeout-seconds <number>`
+- `--edit-scope "glob1,glob2"` allowed edit paths
+- `--branch <name>` / `--no-create-branch`
+
+The command writes run logs to `.bandmaster/sessions/<timestamp>-loop/`:
+- `results.tsv`
+- `events.jsonl`
+
+### `bandmaster history [options]`
+
+Reads loop sessions from `.bandmaster/sessions` and prints:
+- recent session summaries by default
+- detailed per-round output when `--session <id>` is provided
+
+Options:
+- `--limit <number>` number of recent sessions to show (default `10`)
+- `--session <id>` show detailed output for one session
 
 ## Interactive Menu
 
@@ -166,6 +201,16 @@ stopMode = "drain"
 maxTokens = 60000
 maxTurns = 24
 
+[loop]
+runCommand = "npm test -- --runInBand"
+metricPattern = "score:\\s*([0-9.]+)"
+metricSource = "combined"
+optimize = "max"
+keepThreshold = 0
+maxRounds = 12
+timeoutSeconds = 1800
+editScope = ["src/**", "tests/**", "package.json"]
+
 [providers.codex.auth]
 mode = "subscription"
 subscriptionCommand = "codex login"
@@ -205,6 +250,31 @@ npm install
 npm run check
 npm run build
 npm run dev
+```
+
+Loop example:
+
+```bash
+npm run bandmaster -- loop \
+  --config .bandmaster/project.toml \
+  --run-command "npm test -- --runInBand" \
+  --metric-pattern "score:\\s*([0-9.]+)" \
+  --optimize max \
+  --max-rounds 10 \
+  --edit-scope "src/**,tests/**"
+```
+
+History examples:
+
+```bash
+# show last 10 loop sessions
+npm run bandmaster -- history --config .bandmaster/project.toml
+
+# show last 3 sessions
+npm run bandmaster -- history --config .bandmaster/project.toml --limit 3
+
+# show one session in detail
+npm run bandmaster -- history --config .bandmaster/project.toml --session 2026-03-11T10-30-00-000Z-loop
 ```
 
 ## Troubleshooting

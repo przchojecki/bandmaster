@@ -50,6 +50,17 @@ const BudgetConfigSchema = z.object({
   cycle: BudgetCycleConfigSchema
 });
 
+const LoopConfigSchema = z.object({
+  runCommand: z.string().min(1),
+  metricPattern: z.string().min(1),
+  metricSource: z.enum(["stdout", "stderr", "combined"]).default("combined"),
+  optimize: z.enum(["max", "min"]).default("max"),
+  keepThreshold: z.number().default(0),
+  maxRounds: z.number().int().positive().default(20),
+  timeoutSeconds: z.number().int().positive().default(1800),
+  editScope: z.array(z.string().min(1)).min(1).default(["**/*"])
+});
+
 const ProviderAuthSchema = z
   .object({
     mode: z.enum(["api", "subscription"]).default("api"),
@@ -100,6 +111,7 @@ export const ProjectConfigSchema = z.object({
   checkpoint: CheckpointConfigSchema,
   dialogue: DialogueConfigSchema,
   budget: BudgetConfigSchema,
+  loop: LoopConfigSchema.optional(),
   providers: z.record(ProviderConfigSchema).default({})
 });
 
