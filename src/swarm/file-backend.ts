@@ -1,4 +1,12 @@
-import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile
+} from "node:fs/promises";
 import { hostname } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -116,9 +124,17 @@ async function readJsonFile<T>(targetPath: string, fallback: T): Promise<T> {
 async function writeJsonFileAtomic(targetPath: string, value: unknown): Promise<void> {
   const tempPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rm(targetPath, { force: true });
-  await writeFile(targetPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rm(tempPath, { force: true });
+  await rename(tempPath, targetPath);
+}
+
+async function isLockStale(lockPath: string, staleAfterMs: number): Promise<boolean> {
+  try {
+    const lockStat = await stat(lockPath);
+    const ageMs = Date.now() - lockStat.mtimeMs;
+    return ageMs > staleAfterMs;
+  } catch {
+    return false;
+  }
 }
 
 function sanitizeClaims(store: ClaimsStore): ClaimsStore {
@@ -136,7 +152,8 @@ function sanitizeClaims(store: ClaimsStore): ClaimsStore {
 async function withLock<T>(
   lockPath: string,
   fn: () => Promise<T>,
-  timeoutMs = 7000
+  timeoutMs = 7000,
+  staleAfterMs = 30000
 ): Promise<T> {
   const start = Date.now();
   while (true) {
@@ -144,6 +161,10 @@ async function withLock<T>(
       await mkdir(lockPath);
       break;
     } catch {
+      if (await isLockStale(lockPath, staleAfterMs)) {
+        await rm(lockPath, { recursive: true, force: true });
+        continue;
+      }
       if (Date.now() - start > timeoutMs) {
         throw new Error(`Timed out waiting for lock: ${lockPath}`);
       }

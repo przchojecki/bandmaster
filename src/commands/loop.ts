@@ -55,6 +55,7 @@ interface RoundResult {
   reason: string;
   insight?: string;
   hypothesis?: string;
+  optimize?: OptimizeDirection;
 }
 
 function roleLabel(role: Role): string {
@@ -124,7 +125,7 @@ function isPathAllowed(filePath: string, patterns: string[]): boolean {
   return patterns.some((pattern) => globToRegExp(pattern).test(filePath));
 }
 
-function parseMetricPattern(input: string): RegExp {
+export function parseMetricPattern(input: string): RegExp {
   const literal = input.match(/^\/(.+)\/([a-z]*)$/i);
   if (!literal) {
     return new RegExp(input, "m");
@@ -137,8 +138,10 @@ function parseMetricPattern(input: string): RegExp {
   return new RegExp(body, flags);
 }
 
-function parseMetricFromOutput(pattern: RegExp, text: string): number | null {
-  const match = pattern.exec(text);
+export function parseMetricFromOutput(pattern: RegExp, text: string): number | null {
+  const safeFlags = pattern.flags.replace(/g/g, "").replace(/y/g, "");
+  const safePattern = new RegExp(pattern.source, safeFlags);
+  const match = safePattern.exec(text);
   if (!match) {
     return null;
   }
@@ -157,6 +160,12 @@ function parseMetricFromOutput(pattern: RegExp, text: string): number | null {
 
   const parsed = Number.parseFloat(numericMatch[0]);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function runProcess(
@@ -630,35 +639,34 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
       try {
         const claimRaw = `${objective}\n${lastHypothesis}\n${runCommand}\n${editScope.join(",")}`;
         claimKey = normalizeSwarmKey(claimRaw);
-        const claim = await swarmBackend.claimWork({
-          key: claimKey,
-          description: lastHypothesis,
-          round
-        });
-        if (!claim.acquired) {
-          const skipResult: RoundResult = {
-            round,
-            candidateCommit: null,
-            workerExitCode: 0,
-            evalExitCode: null,
-            metric: null,
-            decision: "skip",
-            reason: `swarm claim denied: ${claim.reason}`
-          };
-          await writeFile(resultsPath, resultsToTsvLine(skipResult), {
-            encoding: "utf8",
-            flag: "a"
+
+        const claimWaitDeadlineMs = Date.now() + 30000;
+        while (true) {
+          const claim = await swarmBackend.claimWork({
+            key: claimKey,
+            description: lastHypothesis,
+            round
           });
-          await writeFile(eventsPath, `${JSON.stringify(skipResult)}\n`, {
-            encoding: "utf8",
-            flag: "a"
-          });
-          console.log(
-            `${roleLabel("system")} Round ${round} => SKIP | ${skipResult.reason}`
-          );
+          if (claim.acquired) {
+            claimId = claim.claimId;
+            break;
+          }
+
+          if (Date.now() >= claimWaitDeadlineMs) {
+            console.log(
+              `${roleLabel("system")} Claim busy; retrying this round without consuming budget.`
+            );
+            await sleep(1500);
+            round -= 1;
+            claimKey = null;
+            break;
+          }
+          await sleep(1000);
+        }
+
+        if (!claimKey) {
           continue;
         }
-        claimId = claim.claimId;
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         console.warn(`${roleLabel("system")} Swarm claim failed, continuing local: ${detail}`);
@@ -849,6 +857,7 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
       const extracted = extractInsightAndHypothesis(managerOutput, roundResult);
       roundResult.insight = extracted.insight;
       roundResult.hypothesis = extracted.hypothesis;
+      roundResult.optimize = optimize;
       lastHypothesis = extracted.hypothesis;
 
       await writeFile(resultsPath, resultsToTsvLine(roundResult), {

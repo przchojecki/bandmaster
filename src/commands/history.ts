@@ -3,6 +3,7 @@ import path from "node:path";
 import { loadProjectConfig } from "../config/index.js";
 
 type Decision = "keep" | "discard" | "skip";
+type OptimizeDirection = "max" | "min";
 
 export interface HistoryCommandOptions {
   config?: string;
@@ -30,6 +31,7 @@ interface SessionSummary {
   bestMetric: number | null;
   bestRound: number | null;
   bestCommit: string | null;
+  optimize: OptimizeDirection;
 }
 
 function parseOptionalNumber(raw: string): number | null {
@@ -90,7 +92,30 @@ async function readSessionRows(resultsPath: string): Promise<RoundRow[]> {
   return rows;
 }
 
-function summarizeSession(sessionId: string, rows: RoundRow[]): SessionSummary {
+async function readSessionOptimize(eventsPath: string): Promise<OptimizeDirection> {
+  try {
+    const content = await readFile(eventsPath, "utf8");
+    const lines = content
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    for (const line of lines) {
+      const parsed = JSON.parse(line) as { optimize?: unknown };
+      if (parsed.optimize === "max" || parsed.optimize === "min") {
+        return parsed.optimize;
+      }
+    }
+  } catch {
+    return "max";
+  }
+  return "max";
+}
+
+export function summarizeSession(
+  sessionId: string,
+  rows: RoundRow[],
+  optimize: OptimizeDirection
+): SessionSummary {
   let keeps = 0;
   let discards = 0;
   let skips = 0;
@@ -107,7 +132,11 @@ function summarizeSession(sessionId: string, rows: RoundRow[]): SessionSummary {
       skips += 1;
     }
 
-    if (row.metric !== null && (bestMetric === null || row.metric > bestMetric)) {
+    const isBetter =
+      row.metric !== null &&
+      (bestMetric === null ||
+        (optimize === "max" ? row.metric > bestMetric : row.metric < bestMetric));
+    if (isBetter) {
       bestMetric = row.metric;
       bestRound = row.round;
       bestCommit = row.candidateCommit.length > 0 ? row.candidateCommit : null;
@@ -122,7 +151,8 @@ function summarizeSession(sessionId: string, rows: RoundRow[]): SessionSummary {
     skips,
     bestMetric,
     bestRound,
-    bestCommit
+    bestCommit,
+    optimize
   };
 }
 
@@ -133,7 +163,7 @@ function printSessionSummary(summary: SessionSummary): void {
       : `${summary.bestMetric} (round ${summary.bestRound ?? "?"})`;
   const bestCommit = summary.bestCommit ?? "n/a";
   console.log(
-    `${summary.sessionId} | rounds=${summary.rounds} keep=${summary.keeps} discard=${summary.discards} skip=${summary.skips} | best=${bestMetric} | commit=${bestCommit}`
+    `${summary.sessionId} | optimize=${summary.optimize} rounds=${summary.rounds} keep=${summary.keeps} discard=${summary.discards} skip=${summary.skips} | best=${bestMetric} | commit=${bestCommit}`
   );
 }
 
@@ -190,7 +220,13 @@ export async function historyCommand(options: HistoryCommandOptions): Promise<vo
       );
     }
 
-    const rows = await readSessionRows(path.join(sessionsRoot, target, "results.tsv"));
+    let rows: RoundRow[];
+    try {
+      rows = await readSessionRows(path.join(sessionsRoot, target, "results.tsv"));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to read session "${target}": ${detail}`);
+    }
     printSessionDetails(target, rows);
     return;
   }
@@ -203,8 +239,14 @@ export async function historyCommand(options: HistoryCommandOptions): Promise<vo
 
   console.log(`[System] Showing ${Math.min(limitValue, sessionDirs.length)} most recent sessions`);
   for (const sessionId of sessionDirs.slice(0, limitValue)) {
-    const rows = await readSessionRows(path.join(sessionsRoot, sessionId, "results.tsv"));
-    const summary = summarizeSession(sessionId, rows);
-    printSessionSummary(summary);
+    try {
+      const rows = await readSessionRows(path.join(sessionsRoot, sessionId, "results.tsv"));
+      const optimize = await readSessionOptimize(path.join(sessionsRoot, sessionId, "events.jsonl"));
+      const summary = summarizeSession(sessionId, rows, optimize);
+      printSessionSummary(summary);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`[System] Skipping session ${sessionId}: ${detail}`);
+    }
   }
 }
