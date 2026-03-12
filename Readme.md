@@ -71,6 +71,87 @@ Then use:
 bandmaster --help
 ```
 
+## Quickstart
+
+### 1) Install and build
+
+```bash
+npm install
+npm run build
+```
+
+### 2) Create config (interactive)
+
+```bash
+npm run bandmaster -- init
+```
+
+This writes `.bandmaster/project.toml`.
+
+### 3) Validate config and workspace
+
+```bash
+npm run bandmaster -- run --config .bandmaster/project.toml
+```
+
+## Example Flows
+
+### Flow A: Validate setup only (fast sanity check)
+
+Use this to confirm config, paths, budgets, and entry docs:
+
+```bash
+npm run bandmaster -- run --config .bandmaster/project.toml
+```
+
+### Flow B: Run optimization loop with regex metric
+
+Use when your eval command prints a numeric score in stdout/stderr:
+
+```bash
+npm run bandmaster -- loop \
+  --config .bandmaster/project.toml \
+  --run-command "npm test -- --runInBand" \
+  --metric-pattern "score:\\s*([0-9.]+)" \
+  --optimize max \
+  --max-rounds 5
+```
+
+### Flow C: Run optimization loop with JSON metric
+
+Use when your eval command prints JSON like `{"metrics":{"score":0.91}}`:
+
+```bash
+npm run bandmaster -- loop \
+  --config .bandmaster/project.toml \
+  --run-command "node scripts/eval.js" \
+  --metric-json-path "metrics.score" \
+  --metric-source stdout \
+  --optimize max \
+  --max-rounds 5
+```
+
+### Flow D: Team swarm run (shared folder)
+
+On each machine:
+
+```bash
+npm run bandmaster -- swarm join \
+  --config .bandmaster/project.toml \
+  --swarm-root /shared/bandmaster-swarm \
+  --swarm-id team-a
+```
+
+Then run loop with swarm enabled:
+
+```bash
+npm run bandmaster -- loop \
+  --config .bandmaster/project.toml \
+  --swarm \
+  --swarm-root /shared/bandmaster-swarm \
+  --swarm-id team-a
+```
+
 ## CLI Commands
 
 ### `bandmaster`
