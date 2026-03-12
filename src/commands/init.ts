@@ -4,7 +4,7 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { loadProjectConfig, ProjectConfigSchema } from "../config/index.js";
-import { runCommand, runQuickCommand } from "./run.js";
+import { QuickRunInterruptedError, runCommand, runQuickCommand } from "./run.js";
 import type { ProjectConfig, ProviderName } from "../config/index.js";
 
 type PolicyMode = "auto" | "safe-only" | "manual";
@@ -808,13 +808,21 @@ export async function initCommand(options: InitCommandOptions): Promise<void> {
     );
 
     console.log("\n[System] Starting quick run with inline prompt...\n");
-    await runQuickCommand({
-      config: draft,
-      prompt,
-      mode: durationMode,
-      value: durationValue
-    });
-    return true;
+    try {
+      await runQuickCommand({
+        config: draft,
+        prompt,
+        mode: durationMode,
+        value: durationValue
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof QuickRunInterruptedError) {
+        console.log("\n[System] Quick run interrupted. Returning to Main Menu.");
+        return false;
+      }
+      throw error;
+    }
   };
 
   try {

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { loadProjectConfig } from "../config/index.js";
@@ -44,6 +45,19 @@ interface ProcessResult {
   stderr: string;
   timedOut: boolean;
   durationMs: number;
+}
+
+interface LoopInterruptControl {
+  interrupted: boolean;
+  signal: "SIGINT" | "SIGTERM" | null;
+  activeChild: ChildProcess | null;
+}
+
+class LoopInterruptedError extends Error {
+  constructor() {
+    super("Loop interrupted");
+    this.name = "LoopInterruptedError";
+  }
 }
 
 interface RoundResult {
@@ -205,8 +219,23 @@ function sleep(ms: number): Promise<void> {
 
 async function runProcess(
   command: string,
-  options: { cwd: string; timeoutSeconds?: number; inherit: boolean }
+  options: {
+    cwd: string;
+    timeoutSeconds?: number;
+    inherit: boolean;
+    interruptControl?: LoopInterruptControl;
+  }
 ): Promise<ProcessResult> {
+  if (options.interruptControl?.interrupted) {
+    return {
+      exitCode: 130,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      durationMs: 0
+    };
+  }
+
   const startedAt = Date.now();
   const timeoutMs = options.timeoutSeconds ? options.timeoutSeconds * 1000 : undefined;
 
@@ -215,6 +244,12 @@ async function runProcess(
       cwd: options.cwd,
       stdio: options.inherit ? "inherit" : "pipe"
     });
+    if (options.interruptControl) {
+      options.interruptControl.activeChild = child;
+      if (options.interruptControl.interrupted) {
+        child.kill("SIGTERM");
+      }
+    }
 
     let stdout = "";
     let stderr = "";
@@ -253,6 +288,9 @@ async function runProcess(
     child.on("exit", (code) => {
       if (timer) {
         clearTimeout(timer);
+      }
+      if (options.interruptControl?.activeChild === child) {
+        options.interruptControl.activeChild = null;
       }
       resolve({
         exitCode: code ?? 1,
@@ -308,7 +346,7 @@ async function runModelRole(
   model: string,
   prompt: string,
   cwd: string,
-  options?: { captureOutput?: boolean }
+  options?: { captureOutput?: boolean; interruptControl?: LoopInterruptControl }
 ): Promise<{ exitCode: number; output: string }> {
   const invocation = buildInvocation(provider, model, prompt);
   const available = await isBinaryAvailable(invocation.binary);
@@ -325,6 +363,12 @@ async function runModelRole(
       cwd,
       stdio: shouldCapture ? "pipe" : "inherit"
     });
+    if (options?.interruptControl) {
+      options.interruptControl.activeChild = child;
+      if (options.interruptControl.interrupted) {
+        child.kill("SIGTERM");
+      }
+    }
 
     let output = "";
     if (shouldCapture) {
@@ -341,7 +385,12 @@ async function runModelRole(
     }
 
     child.on("error", () => resolve({ exitCode: 1, output }));
-    child.on("exit", (code) => resolve({ exitCode: code ?? 1, output }));
+    child.on("exit", (code) => {
+      if (options?.interruptControl?.activeChild === child) {
+        options.interruptControl.activeChild = null;
+      }
+      resolve({ exitCode: code ?? 1, output });
+    });
   });
 
   if (result.exitCode === 0) {
@@ -643,8 +692,34 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
   let bestMetric: number | null = null;
   let bestCommit: string | null = null;
   let lastHypothesis = "Start with the most promising change that can move the metric.";
+  const interruptControl: LoopInterruptControl = {
+    interrupted: false,
+    signal: null,
+    activeChild: null
+  };
+  const onSigInt = (): void => {
+    interruptControl.interrupted = true;
+    interruptControl.signal = "SIGINT";
+    if (interruptControl.activeChild) {
+      interruptControl.activeChild.kill("SIGTERM");
+    }
+  };
+  const onSigTerm = (): void => {
+    interruptControl.interrupted = true;
+    interruptControl.signal = "SIGTERM";
+    if (interruptControl.activeChild) {
+      interruptControl.activeChild.kill("SIGTERM");
+    }
+  };
+  process.on("SIGINT", onSigInt);
+  process.on("SIGTERM", onSigTerm);
+  let wasInterrupted = false;
 
-  for (let round = 1; round <= maxRounds; round += 1) {
+  try {
+    for (let round = 1; round <= maxRounds; round += 1) {
+      if (interruptControl.interrupted) {
+        throw new LoopInterruptedError();
+      }
     console.log(`\n${roleLabel("system")} === Round ${round}/${maxRounds} ===`);
 
     if (
@@ -683,6 +758,9 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
 
         const claimWaitDeadlineMs = Date.now() + 30000;
         while (true) {
+          if (interruptControl.interrupted) {
+            throw new LoopInterruptedError();
+          }
           const claim = await swarmBackend.claimWork({
             key: claimKey,
             description: lastHypothesis,
@@ -730,8 +808,12 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
         config.worker.primary.provider,
         config.worker.primary.model,
         workerPrompt,
-        workspacePath
+        workspacePath,
+        { interruptControl }
       ).then((result) => result.exitCode);
+      if (interruptControl.interrupted) {
+        throw new LoopInterruptedError();
+      }
 
     const changedFilesRaw = await mustRunGit("status --porcelain", workspacePath);
     const changedFiles = changedFilesRaw
@@ -783,8 +865,12 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
         const evalResult = await runProcess(runCommand, {
           cwd: workspacePath,
           timeoutSeconds,
-          inherit: false
+          inherit: false,
+          interruptControl
         });
+        if (interruptControl.interrupted) {
+          throw new LoopInterruptedError();
+        }
 
         const metricText =
           metricSource === "stdout"
@@ -895,9 +981,12 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
           config.pm.primary.model,
           managerPrompt,
           workspacePath,
-          { captureOutput: true }
+          { captureOutput: true, interruptControl }
         );
         managerOutput = managerResult.output;
+        if (interruptControl.interrupted) {
+          throw new LoopInterruptedError();
+        }
       }
 
       const extracted = extractInsightAndHypothesis(managerOutput, roundResult);
@@ -951,8 +1040,44 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
       }
     }
   }
+  } catch (error) {
+    if (!(error instanceof LoopInterruptedError)) {
+      throw error;
+    }
+    wasInterrupted = true;
+    try {
+      await mustRunGit("reset --hard", workspacePath);
+      await mustRunGit("clean -fd", workspacePath);
+    } catch {
+      // Best-effort cleanup on interrupt.
+    }
+    await writeFile(
+      path.join(sessionDir, "summary.json"),
+      `${JSON.stringify(
+        {
+          status: "interrupted",
+          signal: interruptControl.signal,
+          bestMetric,
+          bestCommit,
+          sessionId,
+          ts: new Date().toISOString()
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+    console.log(`\n${roleLabel("system")} Loop interrupted immediately by ${interruptControl.signal}.`);
+  } finally {
+    process.removeListener("SIGINT", onSigInt);
+    process.removeListener("SIGTERM", onSigTerm);
+  }
 
-  console.log(`\n${roleLabel("system")} Loop completed.`);
+  if (wasInterrupted) {
+    console.log(`\n${roleLabel("system")} Loop stopped.`);
+  } else {
+    console.log(`\n${roleLabel("system")} Loop completed.`);
+  }
   console.log(
     `${roleLabel("system")} Best metric: ${bestMetric === null ? "none" : String(bestMetric)}`
   );

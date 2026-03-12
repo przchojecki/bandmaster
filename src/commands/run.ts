@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { access } from "node:fs/promises";
 import path from "node:path";
 import { loadProjectConfig } from "../config/index.js";
@@ -16,6 +17,13 @@ export interface QuickRunCommandOptions {
   value: number;
 }
 
+export class QuickRunInterruptedError extends Error {
+  constructor() {
+    super("Quick run interrupted");
+    this.name = "QuickRunInterruptedError";
+  }
+}
+
 interface Invocation {
   binary: string;
   args: string[];
@@ -23,6 +31,11 @@ interface Invocation {
 }
 
 type Role = "worker" | "manager" | "system";
+
+interface InterruptControl {
+  interrupted: boolean;
+  activeChild: ChildProcess | null;
+}
 
 async function docExists(absolutePath: string): Promise<boolean> {
   try {
@@ -54,13 +67,30 @@ async function isBinaryAvailable(binary: string): Promise<boolean> {
   });
 }
 
-async function runInvocation(invocation: Invocation): Promise<number> {
+async function runInvocation(
+  invocation: Invocation,
+  control?: InterruptControl
+): Promise<number> {
+  if (control?.interrupted) {
+    return 130;
+  }
   return new Promise((resolve) => {
     const child = spawn(invocation.binary, invocation.args, {
       stdio: "inherit"
     });
+    if (control) {
+      control.activeChild = child;
+      if (control.interrupted) {
+        child.kill("SIGTERM");
+      }
+    }
     child.on("error", () => resolve(1));
-    child.on("exit", (code) => resolve(code ?? 1));
+    child.on("exit", (code) => {
+      if (control?.activeChild === child) {
+        control.activeChild = null;
+      }
+      resolve(code ?? 1);
+    });
   });
 }
 
@@ -134,7 +164,8 @@ async function runRole(
   role: "worker" | "manager",
   provider: ProviderName,
   model: string,
-  prompt: string
+  prompt: string,
+  control?: InterruptControl
 ): Promise<number> {
   const invocation = buildInvocation(provider, model, prompt);
   const available = await isBinaryAvailable(invocation.binary);
@@ -145,7 +176,7 @@ async function runRole(
   }
 
   console.log(`${roleLabel(role)} Starting ${provider}/${model}`);
-  const exitCode = await runInvocation(invocation);
+  const exitCode = await runInvocation(invocation, control);
   if (exitCode === 0) {
     console.log(`${roleLabel(role)} Finished successfully.`);
   } else {
@@ -235,16 +266,37 @@ export async function runQuickCommand(options: QuickRunCommandOptions): Promise<
   );
   console.log(`${roleLabel("system")} Stop mode setting: ${options.config.budget.stopMode} (advisory in Quick Run)`);
 
+  const control: InterruptControl = {
+    interrupted: false,
+    activeChild: null
+  };
+  const onInterrupt = (): void => {
+    control.interrupted = true;
+    if (control.activeChild) {
+      control.activeChild.kill("SIGTERM");
+    }
+  };
+  process.on("SIGINT", onInterrupt);
+  process.on("SIGTERM", onInterrupt);
+
   let round = 1;
-  while (round <= maxRounds && Date.now() < sessionEndMs) {
+  try {
+    while (round <= maxRounds && Date.now() < sessionEndMs) {
+      if (control.interrupted) {
+        throw new QuickRunInterruptedError();
+      }
     console.log(`\n${roleLabel("worker")} Round ${round}`);
     const workerPrompt = buildWorkerRoundPrompt(options.prompt, round);
     const workerExit = await runRole(
       "worker",
       options.config.worker.primary.provider,
       options.config.worker.primary.model,
-      workerPrompt
+      workerPrompt,
+      control
     );
+      if (control.interrupted) {
+        throw new QuickRunInterruptedError();
+      }
 
     if (options.config.pm.userProxy.enabled && Date.now() < sessionEndMs && round < maxRounds) {
       console.log(`\n${roleLabel("manager")} Round ${round}`);
@@ -253,13 +305,21 @@ export async function runQuickCommand(options: QuickRunCommandOptions): Promise<
         "manager",
         options.config.pm.primary.provider,
         options.config.pm.primary.model,
-        managerPrompt
+        managerPrompt,
+        control
       );
+        if (control.interrupted) {
+          throw new QuickRunInterruptedError();
+        }
     } else if (!options.config.pm.userProxy.enabled) {
       console.log(`${roleLabel("manager")} Skipped (userProxy disabled).`);
     }
 
     round += 1;
+  }
+  } finally {
+    process.removeListener("SIGINT", onInterrupt);
+    process.removeListener("SIGTERM", onInterrupt);
   }
 
   console.log(`\n${roleLabel("system")} Quick run finished.`);
