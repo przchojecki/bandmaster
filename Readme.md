@@ -12,6 +12,7 @@ It currently provides:
 - a metric-driven optimization loop (`bandmaster loop`)
 - session history viewing (`bandmaster history`)
 - collaborative swarm mode (`bandmaster swarm`, `bandmaster loop --swarm`)
+- automated release flow (`bandmaster release`)
 
 ## Current Status
 
@@ -109,6 +110,7 @@ Runs a closed loop for complex tasks:
 Core options:
 - `--run-command "<cmd>"` evaluation command per round
 - `--metric-pattern "<regex>"` regex for metric extraction
+- `--metric-json-path "<path>"` JSON metric path (alternative to regex)
 - `--optimize max|min` metric direction
 - `--keep-threshold <number>` minimum improvement required
 - `--max-rounds <number>`
@@ -140,6 +142,21 @@ Reads loop sessions from `.bandmaster/sessions` and prints:
 Options:
 - `--limit <number>` number of recent sessions to show (default `10`)
 - `--session <id>` show detailed output for one session
+
+### `bandmaster release <version> [options]`
+
+Automates:
+1. clean-tree check
+2. `npm version --no-git-tag-version`
+3. README version update
+4. changelog entry generation
+5. release commit + annotated tag
+6. optional push of commit/tag
+
+Options:
+- `--no-push` skip pushing to origin
+- `--changelog-file <path>` changelog path (default `CHANGELOG.md`)
+- `--tag-message <text>` custom annotated tag message
 
 ### `bandmaster swarm join [options]`
 
@@ -230,6 +247,8 @@ maxTurns = 24
 [loop]
 runCommand = "npm test -- --runInBand"
 metricPattern = "score:\\s*([0-9.]+)"
+# alternatively:
+# metricJsonPath = "metrics.score"
 metricSource = "combined"
 optimize = "max"
 keepThreshold = 0
@@ -300,6 +319,17 @@ npm run bandmaster -- loop \
   --edit-scope "src/**,tests/**"
 ```
 
+Loop JSON metric example:
+
+```bash
+npm run bandmaster -- loop \
+  --config .bandmaster/project.toml \
+  --run-command "node scripts/eval.js" \
+  --metric-json-path "metrics.score" \
+  --metric-source stdout \
+  --optimize max
+```
+
 Swarm examples:
 
 ```bash
@@ -321,6 +351,16 @@ npm run bandmaster -- loop \
   --swarm \
   --swarm-root /shared/bandmaster-swarm \
   --swarm-id research-team-a
+```
+
+Release examples:
+
+```bash
+# release + push
+npm run bandmaster -- release 0.1.5
+
+# release only locally (no push)
+npm run bandmaster -- release patch --no-push
 ```
 
 History examples:

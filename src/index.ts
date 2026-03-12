@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { historyCommand } from "./commands/history.js";
 import { initCommand } from "./commands/init.js";
 import { loopCommand } from "./commands/loop.js";
+import { releaseCommand } from "./commands/release.js";
 import { runCommand } from "./commands/run.js";
 import { swarmJoinCommand, swarmStatusCommand } from "./commands/swarm.js";
 
@@ -50,6 +51,7 @@ program
   .option("--prompt <text>", "Override objective for loop prompts")
   .option("--run-command <command>", "Evaluation command to execute each round")
   .option("--metric-pattern <regex>", "Regex for extracting metric from eval output")
+  .option("--metric-json-path <path>", "JSON path for metric extraction (e.g. metrics.score)")
   .option(
     "--metric-source <source>",
     "Where to parse metric from: stdout, stderr, combined"
@@ -72,6 +74,7 @@ program
       prompt?: string;
       runCommand?: string;
       metricPattern?: string;
+      metricJsonPath?: string;
       metricSource?: "stdout" | "stderr" | "combined";
       optimize?: "max" | "min";
       keepThreshold?: string;
@@ -90,6 +93,7 @@ program
         prompt: options.prompt,
         runCommand: options.runCommand,
         metricPattern: options.metricPattern,
+        metricJsonPath: options.metricJsonPath,
         metricSource: options.metricSource,
         optimize: options.optimize,
         keepThreshold:
@@ -129,6 +133,27 @@ program
         options.limit === undefined ? undefined : Number.parseInt(options.limit, 10)
     });
   });
+
+program
+  .command("release")
+  .description("Automate version bump, changelog update, commit, tag, and push.")
+  .argument("<version>", "Version for npm version (e.g. 0.1.5, patch, minor)")
+  .option("--no-push", "Do not push commit/tag to origin")
+  .option("--changelog-file <path>", "Changelog path", "CHANGELOG.md")
+  .option("--tag-message <text>", "Annotated tag message")
+  .action(
+    async (
+      version: string,
+      options: { push?: boolean; changelogFile?: string; tagMessage?: string }
+    ) => {
+      await releaseCommand({
+        version,
+        push: options.push,
+        changelogFile: options.changelogFile,
+        tagMessage: options.tagMessage
+      });
+    }
+  );
 
 const swarmProgram = program
   .command("swarm")

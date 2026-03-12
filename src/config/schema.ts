@@ -52,13 +52,22 @@ const BudgetConfigSchema = z.object({
 
 const LoopConfigSchema = z.object({
   runCommand: z.string().min(1),
-  metricPattern: z.string().min(1),
+  metricPattern: z.string().min(1).optional(),
+  metricJsonPath: z.string().min(1).optional(),
   metricSource: z.enum(["stdout", "stderr", "combined"]).default("combined"),
   optimize: z.enum(["max", "min"]).default("max"),
   keepThreshold: z.number().default(0),
   maxRounds: z.number().int().positive().default(20),
   timeoutSeconds: z.number().int().positive().default(1800),
   editScope: z.array(z.string().min(1)).min(1).default(["**/*"])
+}).superRefine((value, context) => {
+  if (!value.metricPattern && !value.metricJsonPath) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["metricPattern"],
+      message: "Either metricPattern or metricJsonPath is required."
+    });
+  }
 });
 
 const SwarmConfigSchema = z.object({

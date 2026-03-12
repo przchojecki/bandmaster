@@ -17,6 +17,7 @@ export interface LoopCommandOptions {
   prompt?: string;
   runCommand?: string;
   metricPattern?: string;
+  metricJsonPath?: string;
   metricSource?: MetricSource;
   optimize?: OptimizeDirection;
   keepThreshold?: number;
@@ -160,6 +161,40 @@ export function parseMetricFromOutput(pattern: RegExp, text: string): number | n
 
   const parsed = Number.parseFloat(numericMatch[0]);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function parseMetricFromJsonPath(jsonText: string, jsonPath: string): number | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+
+  const segments = jsonPath
+    .split(".")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+  if (segments.length === 0) {
+    return null;
+  }
+
+  let cursor: unknown = parsed;
+  for (const segment of segments) {
+    if (typeof cursor !== "object" || cursor === null || !(segment in cursor)) {
+      return null;
+    }
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+
+  if (typeof cursor === "number" && Number.isFinite(cursor)) {
+    return cursor;
+  }
+  if (typeof cursor === "string") {
+    const asNumber = Number.parseFloat(cursor);
+    return Number.isFinite(asNumber) ? asNumber : null;
+  }
+  return null;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -494,14 +529,15 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
   const objective = options.prompt ?? config.project.objective;
   const runCommand = options.runCommand ?? loopConfig?.runCommand;
   const metricPatternRaw = options.metricPattern ?? loopConfig?.metricPattern;
+  const metricJsonPath = options.metricJsonPath ?? loopConfig?.metricJsonPath;
   if (!runCommand) {
     throw new Error(
       "Missing run command. Provide --run-command or set [loop].runCommand in config."
     );
   }
-  if (!metricPatternRaw) {
+  if (!metricPatternRaw && !metricJsonPath) {
     throw new Error(
-      "Missing metric pattern. Provide --metric-pattern or set [loop].metricPattern in config."
+      "Missing metric extractor. Provide --metric-pattern or --metric-json-path (or set one in config)."
     );
   }
 
@@ -528,7 +564,7 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
   }
 
   const workspacePath = path.resolve(loaded.cwd, config.project.workspace);
-  const metricPattern = parseMetricPattern(metricPatternRaw);
+  const metricPattern = metricPatternRaw ? parseMetricPattern(metricPatternRaw) : null;
 
   await mustRunGit("rev-parse --is-inside-work-tree", workspacePath);
   const initialStatus = await mustRunGit("status --porcelain", workspacePath);
@@ -589,7 +625,12 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
 
   console.log(`${roleLabel("system")} Loop session directory: ${sessionDir}`);
   console.log(`${roleLabel("system")} Evaluation command: ${runCommand}`);
-  console.log(`${roleLabel("system")} Metric pattern: ${metricPatternRaw}`);
+  if (metricPatternRaw) {
+    console.log(`${roleLabel("system")} Metric pattern: ${metricPatternRaw}`);
+  }
+  if (metricJsonPath) {
+    console.log(`${roleLabel("system")} Metric JSON path: ${metricJsonPath}`);
+  }
   console.log(`${roleLabel("system")} Optimize: ${optimize}`);
   console.log(`${roleLabel("system")} Max rounds: ${maxRounds}`);
   console.log(`${roleLabel("system")} Edit scope: ${editScope.join(", ")}`);
@@ -751,7 +792,12 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
             : metricSource === "stderr"
               ? evalResult.stderr
               : `${evalResult.stdout}\n${evalResult.stderr}`;
-        const metric = parseMetricFromOutput(metricPattern, metricText);
+        const metric =
+          metricJsonPath
+            ? parseMetricFromJsonPath(metricText, metricJsonPath)
+            : metricPattern
+              ? parseMetricFromOutput(metricPattern, metricText)
+              : null;
 
         if (evalResult.exitCode !== 0) {
           await mustRunGit("reset --hard HEAD~1", workspacePath);
