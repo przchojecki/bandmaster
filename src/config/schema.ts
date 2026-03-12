@@ -61,6 +61,17 @@ const LoopConfigSchema = z.object({
   editScope: z.array(z.string().min(1)).min(1).default(["**/*"])
 });
 
+const SwarmConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  backend: z.enum(["file"]).default("file"),
+  root: z.string().min(1).default(".bandmaster/swarm"),
+  swarmId: z.string().min(1).default("default"),
+  agentId: z.string().min(1).optional(),
+  claimTtlSeconds: z.number().int().positive().default(1200),
+  syncEveryNRounds: z.number().int().positive().default(3),
+  maxMetricJump: z.number().positive().default(1000000)
+});
+
 const ProviderAuthSchema = z
   .object({
     mode: z.enum(["api", "subscription"]).default("api"),
@@ -112,6 +123,7 @@ export const ProjectConfigSchema = z.object({
   dialogue: DialogueConfigSchema,
   budget: BudgetConfigSchema,
   loop: LoopConfigSchema.optional(),
+  swarm: SwarmConfigSchema.optional(),
   providers: z.record(ProviderConfigSchema).default({})
 });
 

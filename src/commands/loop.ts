@@ -3,6 +3,9 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { loadProjectConfig } from "../config/index.js";
 import type { ProjectConfig, ProviderName } from "../config/index.js";
+import { createSwarmBackendFromProject } from "../swarm/config.js";
+import type { FileSwarmBackend, SwarmBestRecord } from "../swarm/file-backend.js";
+import { normalizeSwarmKey } from "../swarm/file-backend.js";
 
 type MetricSource = "stdout" | "stderr" | "combined";
 type OptimizeDirection = "max" | "min";
@@ -22,6 +25,10 @@ export interface LoopCommandOptions {
   editScope?: string;
   branch?: string;
   createBranch?: boolean;
+  swarm?: boolean;
+  swarmRoot?: string;
+  swarmId?: string;
+  agentId?: string;
 }
 
 interface Invocation {
@@ -46,6 +53,8 @@ interface RoundResult {
   metric: number | null;
   decision: "keep" | "discard" | "skip";
   reason: string;
+  insight?: string;
+  hypothesis?: string;
 }
 
 function roleLabel(role: Role): string {
@@ -254,30 +263,47 @@ async function runModelRole(
   provider: ProviderName,
   model: string,
   prompt: string,
-  cwd: string
-): Promise<number> {
+  cwd: string,
+  options?: { captureOutput?: boolean }
+): Promise<{ exitCode: number; output: string }> {
   const invocation = buildInvocation(provider, model, prompt);
   const available = await isBinaryAvailable(invocation.binary);
   if (!available) {
     console.log(`${roleLabel(role)} Binary "${invocation.binary}" not found on PATH.`);
     console.log(`${roleLabel(role)} Expected command: ${invocation.display}`);
-    return 127;
+    return { exitCode: 127, output: "" };
   }
 
   console.log(`${roleLabel(role)} Starting ${provider}/${model}`);
-  const result = await new Promise<number>((resolve) => {
+  const shouldCapture = options?.captureOutput === true;
+  const result = await new Promise<{ exitCode: number; output: string }>((resolve) => {
     const child = spawn(invocation.binary, invocation.args, {
       cwd,
-      stdio: "inherit"
+      stdio: shouldCapture ? "pipe" : "inherit"
     });
-    child.on("error", () => resolve(1));
-    child.on("exit", (code) => resolve(code ?? 1));
+
+    let output = "";
+    if (shouldCapture) {
+      child.stdout?.on("data", (chunk) => {
+        const text = String(chunk);
+        output += text;
+        process.stdout.write(text);
+      });
+      child.stderr?.on("data", (chunk) => {
+        const text = String(chunk);
+        output += text;
+        process.stderr.write(text);
+      });
+    }
+
+    child.on("error", () => resolve({ exitCode: 1, output }));
+    child.on("exit", (code) => resolve({ exitCode: code ?? 1, output }));
   });
 
-  if (result === 0) {
+  if (result.exitCode === 0) {
     console.log(`${roleLabel(role)} Finished successfully.`);
   } else {
-    console.log(`${roleLabel(role)} Exited with code ${result}.`);
+    console.log(`${roleLabel(role)} Exited with code ${result.exitCode}.`);
   }
   return result;
 }
@@ -320,6 +346,86 @@ function shouldKeepCandidate(
 
   const delta = optimize === "max" ? metric - bestMetric : bestMetric - metric;
   return delta > keepThreshold;
+}
+
+function extractInsightAndHypothesis(
+  managerOutput: string | null,
+  roundResult: RoundResult
+): { insight: string; hypothesis: string } {
+  if (managerOutput && managerOutput.trim().length > 0) {
+    const insightMatch = managerOutput.match(/insight\s*:\s*(.+)/i);
+    const hypothesisMatch = managerOutput.match(/hypothesis\s*:\s*(.+)/i);
+    return {
+      insight:
+        insightMatch?.[1]?.trim() ??
+        `Round ${roundResult.round} ${roundResult.decision}: ${roundResult.reason}`,
+      hypothesis:
+        hypothesisMatch?.[1]?.trim() ??
+        `Try a different implementation strategy focused on metric improvement.`
+    };
+  }
+  return {
+    insight: `Round ${roundResult.round} ${roundResult.decision}: ${roundResult.reason}`,
+    hypothesis: `Focus next changes on improving metric while staying in allowed edit scope.`
+  };
+}
+
+function isSwarmBestBetter(
+  swarmBest: SwarmBestRecord | null,
+  localBest: number | null,
+  optimize: OptimizeDirection
+): boolean {
+  if (!swarmBest) {
+    return false;
+  }
+  if (localBest === null) {
+    return true;
+  }
+  if (optimize === "max") {
+    return swarmBest.metric > localBest;
+  }
+  return swarmBest.metric < localBest;
+}
+
+async function tryApplySwarmBestPatch(
+  swarmBest: SwarmBestRecord,
+  workspacePath: string,
+  sessionDir: string,
+  round: number
+): Promise<{ applied: boolean; reason: string }> {
+  if (!swarmBest.patch || swarmBest.patch.trim().length === 0) {
+    return { applied: false, reason: "no patch artifact on swarm best record" };
+  }
+
+  const patchPath = path.join(sessionDir, `swarm-best-round-${round}.patch`);
+  await writeFile(patchPath, swarmBest.patch, "utf8");
+  const applyResult = await runProcess(`git apply --3way "${patchPath}"`, {
+    cwd: workspacePath,
+    inherit: false
+  });
+  if (applyResult.exitCode !== 0) {
+    await mustRunGit("reset --hard", workspacePath);
+    await mustRunGit("clean -fd", workspacePath);
+    return { applied: false, reason: "patch apply failed" };
+  }
+
+  const status = await mustRunGit("status --porcelain", workspacePath);
+  if (status.trim().length === 0) {
+    return { applied: false, reason: "patch produced no changes" };
+  }
+
+  await mustRunGit("add -A", workspacePath);
+  const commitAttempt = await runGit(
+    `commit -m "bandmaster loop: sync swarm best from ${swarmBest.agentId}"`,
+    workspacePath
+  );
+  if (commitAttempt.exitCode !== 0) {
+    await mustRunGit("reset --hard", workspacePath);
+    await mustRunGit("clean -fd", workspacePath);
+    return { applied: false, reason: "failed to commit synced patch" };
+  }
+
+  return { applied: true, reason: "applied and committed swarm best patch" };
 }
 
 function buildWorkerPrompt(
@@ -439,9 +545,32 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
     "sessions",
     `${timestampForPath()}-loop`
   );
+  const sessionId = path.basename(sessionDir);
   await mkdir(sessionDir, { recursive: true });
   const resultsPath = path.join(sessionDir, "results.tsv");
   const eventsPath = path.join(sessionDir, "events.jsonl");
+
+  let swarmBackend: FileSwarmBackend | null = null;
+  if (options.swarm ?? config.swarm?.enabled ?? false) {
+    try {
+      swarmBackend = await createSwarmBackendFromProject(config, workspacePath, {
+        enabled: options.swarm,
+        root: options.swarmRoot,
+        swarmId: options.swarmId,
+        agentId: options.agentId
+      });
+      if (swarmBackend) {
+        await swarmBackend.join();
+        console.log(
+          `${roleLabel("system")} Swarm mode enabled: ${swarmBackend.config.swarmId} (${swarmBackend.config.agentId})`
+        );
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`${roleLabel("system")} Swarm unavailable, continuing local-only: ${detail}`);
+      swarmBackend = null;
+    }
+  }
 
   await writeFile(
     resultsPath,
@@ -455,28 +584,105 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
   console.log(`${roleLabel("system")} Optimize: ${optimize}`);
   console.log(`${roleLabel("system")} Max rounds: ${maxRounds}`);
   console.log(`${roleLabel("system")} Edit scope: ${editScope.join(", ")}`);
+  if (swarmBackend) {
+    console.log(
+      `${roleLabel("system")} Swarm sync cadence: every ${swarmBackend.config.syncEveryNRounds} rounds`
+    );
+  }
 
   let bestMetric: number | null = null;
   let bestCommit: string | null = null;
+  let lastHypothesis = "Start with the most promising change that can move the metric.";
 
   for (let round = 1; round <= maxRounds; round += 1) {
     console.log(`\n${roleLabel("system")} === Round ${round}/${maxRounds} ===`);
 
-    const workerPrompt = buildWorkerPrompt(
-      objective,
-      round,
-      maxRounds,
-      editScope,
-      bestMetric,
-      optimize
-    );
-    const workerExitCode = await runModelRole(
-      "worker",
-      config.worker.primary.provider,
-      config.worker.primary.model,
-      workerPrompt,
-      workspacePath
-    );
+    if (
+      swarmBackend &&
+      round % swarmBackend.config.syncEveryNRounds === 0
+    ) {
+      try {
+        const swarmBest = await swarmBackend.getBest();
+        if (isSwarmBestBetter(swarmBest, bestMetric, optimize)) {
+          const apply = await tryApplySwarmBestPatch(
+            swarmBest as SwarmBestRecord,
+            workspacePath,
+            sessionDir,
+            round
+          );
+          if (apply.applied && swarmBest) {
+            bestMetric = swarmBest.metric;
+            bestCommit = await mustRunGit("rev-parse HEAD", workspacePath);
+          }
+          console.log(
+            `${roleLabel("system")} Swarm sync attempt: ${apply.reason}`
+          );
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`${roleLabel("system")} Swarm sync failed, continuing: ${detail}`);
+      }
+    }
+
+    let claimKey: string | null = null;
+    let claimId: string | null = null;
+    if (swarmBackend) {
+      try {
+        const claimRaw = `${objective}\n${lastHypothesis}\n${runCommand}\n${editScope.join(",")}`;
+        claimKey = normalizeSwarmKey(claimRaw);
+        const claim = await swarmBackend.claimWork({
+          key: claimKey,
+          description: lastHypothesis,
+          round
+        });
+        if (!claim.acquired) {
+          const skipResult: RoundResult = {
+            round,
+            candidateCommit: null,
+            workerExitCode: 0,
+            evalExitCode: null,
+            metric: null,
+            decision: "skip",
+            reason: `swarm claim denied: ${claim.reason}`
+          };
+          await writeFile(resultsPath, resultsToTsvLine(skipResult), {
+            encoding: "utf8",
+            flag: "a"
+          });
+          await writeFile(eventsPath, `${JSON.stringify(skipResult)}\n`, {
+            encoding: "utf8",
+            flag: "a"
+          });
+          console.log(
+            `${roleLabel("system")} Round ${round} => SKIP | ${skipResult.reason}`
+          );
+          continue;
+        }
+        claimId = claim.claimId;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`${roleLabel("system")} Swarm claim failed, continuing local: ${detail}`);
+        claimKey = null;
+        claimId = null;
+      }
+    }
+
+    try {
+      const workerPrompt = buildWorkerPrompt(
+        objective,
+        round,
+        maxRounds,
+        editScope,
+        bestMetric,
+        optimize
+      );
+      const workerExitCode = await runModelRole(
+        "worker",
+        config.worker.primary.provider,
+        config.worker.primary.model,
+        workerPrompt,
+        workspacePath
+      ).then((result) => result.exitCode);
 
     const changedFilesRaw = await mustRunGit("status --porcelain", workspacePath);
     const changedFiles = changedFilesRaw
@@ -486,6 +692,7 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
       .map((line) => line.slice(3).trim());
 
     let roundResult: RoundResult;
+    let candidatePatch = "";
     if (changedFiles.length === 0) {
       roundResult = {
         round,
@@ -522,6 +729,8 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
         }
 
         const candidateCommit = await mustRunGit("rev-parse HEAD", workspacePath);
+        const patchResult = await runGit(`show --format= ${candidateCommit}`, workspacePath);
+        candidatePatch = patchResult.exitCode === 0 ? patchResult.stdout : "";
         const evalResult = await runProcess(runCommand, {
           cwd: workspacePath,
           timeoutSeconds,
@@ -574,6 +783,28 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
             decision: "keep",
             reason: "metric improved enough to keep candidate"
           };
+
+          if (swarmBackend) {
+            try {
+              const update = await swarmBackend.tryUpdateBest({
+                metric,
+                optimize,
+                sessionId,
+                round,
+                commit: candidateCommit,
+                patch: candidatePatch,
+                reason: roundResult.reason
+              });
+              if (!update.updated) {
+                console.log(
+                  `${roleLabel("system")} Swarm best not updated: ${update.reason}`
+                );
+              }
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error);
+              console.warn(`${roleLabel("system")} Swarm best update failed: ${detail}`);
+            }
+          }
         } else {
           await mustRunGit("reset --hard HEAD~1", workspacePath);
           await mustRunGit("clean -fd", workspacePath);
@@ -590,32 +821,79 @@ export async function loopCommand(options: LoopCommandOptions): Promise<void> {
       }
     }
 
-    await writeFile(resultsPath, resultsToTsvLine(roundResult), { encoding: "utf8", flag: "a" });
-    await writeFile(eventsPath, `${JSON.stringify(roundResult)}\n`, {
-      encoding: "utf8",
-      flag: "a"
-    });
-
-    const metricLabel = roundResult.metric === null ? "n/a" : String(roundResult.metric);
-    console.log(
-      `${roleLabel("system")} Round ${round} => ${roundResult.decision.toUpperCase()} | metric=${metricLabel} | ${roundResult.reason}`
-    );
-
-    if (config.pm.userProxy.enabled) {
-      const managerPrompt = buildManagerPrompt(
-        objective,
-        round,
-        roundResult.metric,
-        roundResult.decision,
-        roundResult.reason
+      const metricLabel = roundResult.metric === null ? "n/a" : String(roundResult.metric);
+      console.log(
+        `${roleLabel("system")} Round ${round} => ${roundResult.decision.toUpperCase()} | metric=${metricLabel} | ${roundResult.reason}`
       );
-      await runModelRole(
-        "manager",
-        config.pm.primary.provider,
-        config.pm.primary.model,
-        managerPrompt,
-        workspacePath
-      );
+
+      let managerOutput: string | null = null;
+      if (config.pm.userProxy.enabled) {
+        const managerPrompt = buildManagerPrompt(
+          objective,
+          round,
+          roundResult.metric,
+          roundResult.decision,
+          `${roundResult.reason}\n\nReturn two explicit lines:\nINSIGHT: <what we learned>\nHYPOTHESIS: <what to try next>`
+        );
+        const managerResult = await runModelRole(
+          "manager",
+          config.pm.primary.provider,
+          config.pm.primary.model,
+          managerPrompt,
+          workspacePath,
+          { captureOutput: true }
+        );
+        managerOutput = managerResult.output;
+      }
+
+      const extracted = extractInsightAndHypothesis(managerOutput, roundResult);
+      roundResult.insight = extracted.insight;
+      roundResult.hypothesis = extracted.hypothesis;
+      lastHypothesis = extracted.hypothesis;
+
+      await writeFile(resultsPath, resultsToTsvLine(roundResult), {
+        encoding: "utf8",
+        flag: "a"
+      });
+      await writeFile(eventsPath, `${JSON.stringify(roundResult)}\n`, {
+        encoding: "utf8",
+        flag: "a"
+      });
+
+      if (swarmBackend) {
+        try {
+          await swarmBackend.publishRound({
+            sessionId,
+            round,
+            metric: roundResult.metric,
+            decision: roundResult.decision,
+            reason: roundResult.reason,
+            candidateCommit: roundResult.candidateCommit,
+            optimize,
+            patch: candidatePatch.length > 0 ? candidatePatch : undefined,
+            workerExitCode: roundResult.workerExitCode,
+            evalExitCode: roundResult.evalExitCode
+          });
+          await swarmBackend.publishInsight({
+            sessionId,
+            round,
+            insight: extracted.insight,
+            hypothesis: extracted.hypothesis
+          });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          console.warn(`${roleLabel("system")} Swarm publish failed, continuing: ${detail}`);
+        }
+      }
+    } finally {
+      if (swarmBackend && claimKey) {
+        try {
+          await swarmBackend.releaseWork(claimKey, claimId);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          console.warn(`${roleLabel("system")} Swarm claim release failed: ${detail}`);
+        }
+      }
     }
   }
 

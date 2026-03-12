@@ -6,6 +6,7 @@ import { historyCommand } from "./commands/history.js";
 import { initCommand } from "./commands/init.js";
 import { loopCommand } from "./commands/loop.js";
 import { runCommand } from "./commands/run.js";
+import { swarmJoinCommand, swarmStatusCommand } from "./commands/swarm.js";
 
 const require = createRequire(import.meta.url);
 const packageJson = require("../package.json") as { version?: string };
@@ -60,6 +61,11 @@ program
   .option("--edit-scope <patterns>", "Comma-separated glob allowlist for editable files")
   .option("--branch <name>", "Branch to create for this loop session")
   .option("--no-create-branch", "Run on current branch instead of creating a session branch")
+  .option("--swarm", "Enable collaborative swarm mode")
+  .option("--no-swarm", "Disable collaborative swarm mode")
+  .option("--swarm-root <path>", "Shared root path for file-based swarm backend")
+  .option("--swarm-id <id>", "Swarm namespace id")
+  .option("--agent-id <id>", "Override swarm agent id")
   .action(
     async (options: {
       config?: string;
@@ -74,6 +80,10 @@ program
       editScope?: string;
       branch?: string;
       createBranch?: boolean;
+      swarm?: boolean;
+      swarmRoot?: string;
+      swarmId?: string;
+      agentId?: string;
     }) => {
       await loopCommand({
         config: options.config,
@@ -96,7 +106,11 @@ program
             : Number.parseInt(options.timeoutSeconds, 10),
         editScope: options.editScope,
         branch: options.branch,
-        createBranch: options.createBranch
+        createBranch: options.createBranch,
+        swarm: options.swarm,
+        swarmRoot: options.swarmRoot,
+        swarmId: options.swarmId,
+        agentId: options.agentId
       });
     }
   );
@@ -115,6 +129,56 @@ program
         options.limit === undefined ? undefined : Number.parseInt(options.limit, 10)
     });
   });
+
+const swarmProgram = program
+  .command("swarm")
+  .description("Collaborative swarm coordination commands.");
+
+swarmProgram
+  .command("join")
+  .description("Join a swarm and persist local agent identity.")
+  .option("-c, --config <path>", "Path to project config file")
+  .option("--swarm-root <path>", "Shared root path for file-based swarm backend")
+  .option("--swarm-id <id>", "Swarm namespace id")
+  .option("--agent-id <id>", "Override swarm agent id")
+  .action(
+    async (options: {
+      config?: string;
+      swarmRoot?: string;
+      swarmId?: string;
+      agentId?: string;
+    }) => {
+      await swarmJoinCommand({
+        config: options.config,
+        root: options.swarmRoot,
+        swarmId: options.swarmId,
+        agentId: options.agentId
+      });
+    }
+  );
+
+swarmProgram
+  .command("status")
+  .description("Show current swarm status and best-known record.")
+  .option("-c, --config <path>", "Path to project config file")
+  .option("--swarm-root <path>", "Shared root path for file-based swarm backend")
+  .option("--swarm-id <id>", "Swarm namespace id")
+  .option("--agent-id <id>", "Override swarm agent id")
+  .action(
+    async (options: {
+      config?: string;
+      swarmRoot?: string;
+      swarmId?: string;
+      agentId?: string;
+    }) => {
+      await swarmStatusCommand({
+        config: options.config,
+        root: options.swarmRoot,
+        swarmId: options.swarmId,
+        agentId: options.agentId
+      });
+    }
+  );
 
 program
   .parseAsync(process.argv)

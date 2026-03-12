@@ -11,10 +11,11 @@ It currently provides:
 - a non-interactive config validation command (`bandmaster run`)
 - a metric-driven optimization loop (`bandmaster loop`)
 - session history viewing (`bandmaster history`)
+- collaborative swarm mode (`bandmaster swarm`, `bandmaster loop --swarm`)
 
 ## Current Status
 
-This repository is an early scaffold (`v0.1.2`).
+This repository is an early scaffold (`v0.1.3`).
 
 Implemented now:
 - interactive configuration menu
@@ -22,6 +23,7 @@ Implemented now:
 - `run` command that validates config and reports effective settings
 - "Quick Run" loop (round-based or hour-based) that launches worker/manager CLIs
 - `loop` command that keeps/discards candidate commits by evaluation metric
+- swarm claim/publish/sync flow with file-backed shared state
 
 Not implemented yet:
 - full orchestration engine/state machine
@@ -113,10 +115,21 @@ Core options:
 - `--timeout-seconds <number>`
 - `--edit-scope "glob1,glob2"` allowed edit paths
 - `--branch <name>` / `--no-create-branch`
+- `--swarm` / `--no-swarm`
+- `--swarm-root <path>`
+- `--swarm-id <id>`
+- `--agent-id <id>`
 
 The command writes run logs to `.bandmaster/sessions/<timestamp>-loop/`:
 - `results.tsv`
 - `events.jsonl`
+
+When swarm mode is enabled, each round also:
+- attempts a claim to reduce duplicate work
+- publishes round results and manager insight/hypothesis
+- updates shared best with race-safe compare/update
+- periodically syncs from shared best patch artifact
+- falls back to local-only operation if swarm backend is unavailable
 
 ### `bandmaster history [options]`
 
@@ -127,6 +140,19 @@ Reads loop sessions from `.bandmaster/sessions` and prints:
 Options:
 - `--limit <number>` number of recent sessions to show (default `10`)
 - `--session <id>` show detailed output for one session
+
+### `bandmaster swarm join [options]`
+
+Joins a swarm and persists local agent identity in `.bandmaster/swarm-agent.json`.
+
+### `bandmaster swarm status [options]`
+
+Shows:
+- current agent id
+- swarm id and backend root
+- active claim count
+- total published results and insights
+- best shared metric record
 
 ## Interactive Menu
 
@@ -211,6 +237,16 @@ maxRounds = 12
 timeoutSeconds = 1800
 editScope = ["src/**", "tests/**", "package.json"]
 
+[swarm]
+enabled = false
+backend = "file"
+root = ".bandmaster/swarm"
+swarmId = "default"
+# agentId is optional; generated or reused from .bandmaster/swarm-agent.json
+claimTtlSeconds = 1200
+syncEveryNRounds = 3
+maxMetricJump = 1000000
+
 [providers.codex.auth]
 mode = "subscription"
 subscriptionCommand = "codex login"
@@ -262,6 +298,29 @@ npm run bandmaster -- loop \
   --optimize max \
   --max-rounds 10 \
   --edit-scope "src/**,tests/**"
+```
+
+Swarm examples:
+
+```bash
+# join a shared swarm namespace (once per machine/workspace)
+npm run bandmaster -- swarm join \
+  --config .bandmaster/project.toml \
+  --swarm-root /shared/bandmaster-swarm \
+  --swarm-id research-team-a
+
+# check shared swarm status
+npm run bandmaster -- swarm status \
+  --config .bandmaster/project.toml \
+  --swarm-root /shared/bandmaster-swarm \
+  --swarm-id research-team-a
+
+# run loop with swarm coordination
+npm run bandmaster -- loop \
+  --config .bandmaster/project.toml \
+  --swarm \
+  --swarm-root /shared/bandmaster-swarm \
+  --swarm-id research-team-a
 ```
 
 History examples:
