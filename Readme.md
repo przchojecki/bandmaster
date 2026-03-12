@@ -16,7 +16,7 @@ It currently provides:
 
 ## Current Status
 
-This repository is an early scaffold (`v0.1.3`).
+This repository is an early scaffold (`v0.1.5`).
 
 Implemented now:
 - interactive configuration menu
